@@ -89,11 +89,43 @@ DB_COLS = [
 ]
 
 
+NOISY_LOGGER_NAMES = (
+    "slack_sdk",
+    "slack_sdk.web",
+    "slack_sdk.web.base_client",
+    "slack_bolt",
+    "urllib3",
+    "boxsdk",
+    "boxsdk.network",
+    "gasanalytics",
+)
+
+
 class _TeeStream:
     def __init__(self, stream, log):
         self.stream = stream
         self.log = log
         self._buffer = ""
+
+    def _should_log_line(self, line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return False
+        lowered = stripped.lower()
+        if stripped.startswith(("\x1b[", "POST ", "GET ", '"POST ', '"GET ')):
+            return False
+        if any(
+            token in lowered
+            for token in (
+                "api.box.com",
+                "upload.box.com",
+                "slack.com/api",
+                "chat.postmessage",
+                "chat_postmessage",
+            )
+        ):
+            return False
+        return True
 
     def write(self, data):
         if not data:
@@ -102,14 +134,16 @@ class _TeeStream:
         self._buffer += data
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            if line:
+            if self._should_log_line(line):
                 self.log.info(line)
         return len(data)
 
     def flush(self):
         self.stream.flush()
-        if self._buffer:
+        if self._buffer and self._should_log_line(self._buffer):
             self.log.info(self._buffer)
+            self._buffer = ""
+        elif self._buffer:
             self._buffer = ""
 
 
@@ -122,6 +156,9 @@ def setup_logging() -> logging.Logger:
         handlers=[logging.FileHandler(LOG_FILE, mode="a")],
         force=True,
     )
+    for logger_name in NOISY_LOGGER_NAMES:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
     logger = logging.getLogger("extractor")
     sys.stdout = _TeeStream(sys.__stdout__, logger)
     print(f"Logging to {LOG_FILE}")
@@ -133,6 +170,7 @@ def process_customer(
     start_date: str,
     end_date: str,
     send_email: bool,
+    app: App,
 ) -> None:
     customer_name = customer_info["Name"]
     print(f"-----{customer_name}")
@@ -141,8 +179,8 @@ def process_customer(
     connection = CONN_DICT[customer_info["DBLocation"]]
     box_folder_id = customer_info["BoxFolderId"]
     xchange_location = customer_info["XchangeLocation"]
-
-    filename = f"{customer_name}_{SUFFIX}.xlsx"
+    
+    filename = f"{customer_name}_{SUFFIX}_{end_date}.xlsx"
     output_path = EXTRACTOR_DIR / filename
 
     recipients = PeakAboveSATRecipients.query_table(arguments={"db_path": DB_PATH})
@@ -262,6 +300,22 @@ def process_customer(
         print("No new peaks to process")
         output_log += "No new peaks to process\n"
 
+    #Send the log to the slack channel
+    app.client.chat_postMessage(
+            channel='C0C0F3XA8NQ',
+            text="Data Extractions Uploaded",
+            emoji=True,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": output_log
+                    }
+                }
+            ]
+        )
+
 
 def main() -> None:
     _ = setup_logging()
@@ -272,10 +326,10 @@ def main() -> None:
     send_email = True
 
     slack_bot_token = os.getenv("SLACKBOTTOKEN")
-    App(token=slack_bot_token)
+    app = App(token=slack_bot_token)
 
     for _, customer_info in customers.iterrows():
-        process_customer(customer_info, start_date, end_date, send_email)
+        process_customer(customer_info, start_date, end_date, send_email, app)
 
 
 if __name__ == "__main__":
